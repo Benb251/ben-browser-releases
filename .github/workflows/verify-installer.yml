@@ -1,0 +1,73 @@
+name: Verify Ben installer
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        required: true
+        type: string
+      sha256:
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  clean-windows:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download exact candidate
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          gh release download $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --dir candidate --pattern '*-setup.exe' --pattern 'installed-binaries.json' --pattern 'SHA256SUMS.txt'
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate download failed' }
+      - name: Install, launch, reinstall and uninstall
+        shell: pwsh
+        env:
+          EXPECTED_SHA256: ${{ inputs.sha256 }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $setups = @(Get-ChildItem candidate -Filter '*-setup.exe')
+          if ($setups.Count -ne 1) { throw 'Expected exactly one installer' }
+          $setupPath = $setups[0].FullName
+          $actual = (Get-FileHash $setupPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $env:EXPECTED_SHA256.ToLowerInvariant()) { throw 'Installer hash mismatch' }
+          $sumLine = "$actual  $($setups[0].Name)"
+          if ((Get-Content candidate/SHA256SUMS.txt).Trim() -ne $sumLine) { throw 'Published checksum mismatch' }
+          $installDir = Join-Path $env:LOCALAPPDATA 'Ben Donut'
+          if (Test-Path $installDir) { throw 'Runner is not clean' }
+          $expected = Get-Content candidate/installed-binaries.json -Raw | ConvertFrom-Json -AsHashtable
+          function Check-Binaries {
+            foreach ($name in @('donutbrowser.exe','donut-proxy.exe','xray.exe')) {
+              if ((Get-FileHash (Join-Path $installDir $name) -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected[$name]) { throw "Installed binary mismatch: $name" }
+            }
+            $version = (Get-Item (Join-Path $installDir 'donutbrowser.exe')).VersionInfo
+            if ($version.ProductName -ne 'Ben Donut' -or $version.ProductVersion -ne $env:RELEASE_TAG.TrimStart('v')) { throw 'Product identity mismatch' }
+          }
+          $setup = Start-Process $setupPath -ArgumentList '/S' -PassThru -Wait -WindowStyle Hidden
+          if ($setup.ExitCode -ne 0) { throw "Install failed: $($setup.ExitCode)" }
+          Check-Binaries
+          $app = Start-Process (Join-Path $installDir 'donutbrowser.exe') -PassThru
+          Start-Sleep -Seconds 20
+          $app.Refresh()
+          if ($app.HasExited) { throw 'App exited during launch smoke check' }
+          if ($app.MainWindowHandle -eq 0 -or -not $app.Responding) { throw 'App has no responsive main window' }
+          Stop-Process -Id $app.Id -Force
+          $setup = Start-Process $setupPath -ArgumentList '/S' -PassThru -Wait -WindowStyle Hidden
+          if ($setup.ExitCode -ne 0) { throw 'Reinstall failed' }
+          Check-Binaries
+          $uninstallers = @(Get-ChildItem $installDir -Filter '*uninstall*.exe')
+          if ($uninstallers.Count -ne 1) { throw 'Expected one uninstaller' }
+          $uninstall = Start-Process $uninstallers[0].FullName -ArgumentList '/S' -PassThru -Wait -WindowStyle Hidden
+          if ($uninstall.ExitCode -ne 0) { throw 'Uninstall failed' }
+          for ($i = 0; $i -lt 30 -and (Test-Path (Join-Path $installDir 'donutbrowser.exe')); $i++) { Start-Sleep -Seconds 1 }
+          if (Test-Path (Join-Path $installDir 'donutbrowser.exe')) { throw 'App remains after uninstall' }
+          "PASS: $env:RELEASE_TAG / $actual / clean install, binary identity, responsive window, reinstall, uninstall" | Tee-Object -FilePath acceptance.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-installer-acceptance
+          path: acceptance.txt
